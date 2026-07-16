@@ -55,6 +55,24 @@ function New-ErrorObject {
     return [pscustomobject]@{ Target = 'LocalComputer'; Operation = $script:Operation; Message = $Message; Category = 'Execution'; RecommendedAction = $RecommendedAction }
 }
 
+function Get-NativeOutputPath {
+    Param([string]$OperationName,[string]$OutputTimestamp)
+    $logDirectory = Split-Path -Path $script:LogPath -Parent
+    if ([string]::IsNullOrWhiteSpace($logDirectory)) { $logDirectory = 'C:\Temp' }
+    $scanResultDirectory = Join-Path -Path $logDirectory -ChildPath 'scan-results'
+    if (-not (Test-Path -LiteralPath $scanResultDirectory -PathType Container)) { New-Item -Path $scanResultDirectory -ItemType Directory -Force | Out-Null }
+    return (Join-Path -Path $scanResultDirectory -ChildPath ('{0}-{1}.txt' -f $OperationName, $OutputTimestamp))
+}
+
+function Test-OutputPattern {
+    Param([string]$Text,[string]$Pattern)
+    if ($Text -match [regex]::Escape($Pattern)) { return $true }
+    $compactText = $Text -replace '\s',''
+    $compactPattern = $Pattern -replace '\s',''
+    if ($compactText -match [regex]::Escape($compactPattern)) { return $true }
+    return $false
+}
+
 function Complete-Script {
     Param([pscustomobject]$Result)
     if (-not [string]::IsNullOrWhiteSpace($Result.ResultPath)) {
@@ -97,7 +115,7 @@ if (-not (Test-Path -LiteralPath $dismPath -PathType Leaf)) {
 $output = & $dismPath /Online /Cleanup-Image /CheckHealth 2>&1
 $toolExitCode = $LASTEXITCODE
 $outputText = ($output | Out-String).Trim()
-$outputPath = Join-Path -Path $env:TEMP -ChildPath ('{0}-{1}.txt' -f $Operation, $Timestamp)
+$outputPath = Get-NativeOutputPath -OperationName $Operation -OutputTimestamp $Timestamp
 if (-not [string]::IsNullOrWhiteSpace($outputText)) { Set-Content -LiteralPath $outputPath -Value $outputText -Encoding UTF8 }
 $result.Data.ToolExitCode = $toolExitCode
 $result.Data.NativeOutputPath = $outputPath
@@ -105,13 +123,13 @@ $result.Data.NativeOutputPath = $outputPath
 if ($toolExitCode -ne 0) {
     $result.Status = 'Failed'; $result.ExitCode = 1; $result.Message = ('DISM CheckHealth failed with native exit code {0}.' -f $toolExitCode); $result.RecommendedAction = 'ReviewLog'; $result.Errors += New-ErrorObject -Message $result.Message -RecommendedAction 'ReviewLog'
 }
-elseif ($outputText -match 'No component store corruption detected') {
+elseif (Test-OutputPattern -Text $outputText -Pattern 'No component store corruption detected') {
     $result.Status = 'NoActionNeeded'; $result.ExitCode = 0; $result.Message = 'No component store corruption detected.'; $result.RecommendedAction = 'RunSfcScan'; $result.Data.RawStatus = 'NoCorruption'; $result.Data.SfcRequired = $true
 }
-elseif ($outputText -match 'The component store is repairable') {
+elseif (Test-OutputPattern -Text $outputText -Pattern 'The component store is repairable') {
     $result.Status = 'Success'; $result.ExitCode = 0; $result.Message = 'The component store is repairable.'; $result.RecommendedAction = 'RunDismScanHealth'; $result.Data.RawStatus = 'Repairable'; $result.Data.CorruptionDetected = $true; $result.Data.Repairable = $true; $result.Data.DismScanRequired = $true
 }
-elseif ($outputText -match 'The component store cannot be repaired') {
+elseif (Test-OutputPattern -Text $outputText -Pattern 'The component store cannot be repaired') {
     $result.Status = 'Failed'; $result.ExitCode = 1; $result.Message = 'The component store cannot be repaired automatically.'; $result.RecommendedAction = 'ManualRepairRequired'; $result.Data.RawStatus = 'NotRepairable'; $result.Data.CorruptionDetected = $true; $result.Errors += New-ErrorObject -Message $result.Message -RecommendedAction 'ManualRepairRequired'
 }
 else {
