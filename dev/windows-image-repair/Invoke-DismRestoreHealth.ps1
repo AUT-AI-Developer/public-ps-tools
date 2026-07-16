@@ -52,6 +52,24 @@ function New-ErrorObject {
     return [pscustomobject]@{ Target = 'LocalComputer'; Operation = $script:Operation; Message = $Message; Category = 'Execution'; RecommendedAction = $RecommendedAction }
 }
 
+function Get-NativeOutputPath {
+    Param([string]$OperationName,[string]$OutputTimestamp)
+    $logDirectory = Split-Path -Path $script:LogPath -Parent
+    if ([string]::IsNullOrWhiteSpace($logDirectory)) { $logDirectory = 'C:\Temp' }
+    $scanResultDirectory = Join-Path -Path $logDirectory -ChildPath 'scan-results'
+    if (-not (Test-Path -LiteralPath $scanResultDirectory -PathType Container)) { New-Item -Path $scanResultDirectory -ItemType Directory -Force | Out-Null }
+    return (Join-Path -Path $scanResultDirectory -ChildPath ('{0}-{1}.txt' -f $OperationName, $OutputTimestamp))
+}
+
+function Test-OutputPattern {
+    Param([string]$Text,[string]$Pattern)
+    if ($Text -match [regex]::Escape($Pattern)) { return $true }
+    $compactText = $Text -replace '\s',''
+    $compactPattern = $Pattern -replace '\s',''
+    if ($compactText -match [regex]::Escape($compactPattern)) { return $true }
+    return $false
+}
+
 function Complete-Script {
     Param([pscustomobject]$Result)
     if (-not [string]::IsNullOrWhiteSpace($Result.ResultPath)) {
@@ -94,12 +112,12 @@ if (-not (Test-Path -LiteralPath $dismPath -PathType Leaf)) {
 $output = & $dismPath /Online /Cleanup-Image /RestoreHealth 2>&1
 $toolExitCode = $LASTEXITCODE
 $outputText = ($output | Out-String).Trim()
-$outputPath = Join-Path -Path $env:TEMP -ChildPath ('{0}-{1}.txt' -f $Operation, $Timestamp)
+$outputPath = Get-NativeOutputPath -OperationName $Operation -OutputTimestamp $Timestamp
 if (-not [string]::IsNullOrWhiteSpace($outputText)) { Set-Content -LiteralPath $outputPath -Value $outputText -Encoding UTF8 }
 $result.Data.ToolExitCode = $toolExitCode
 $result.Data.NativeOutputPath = $outputPath
 
-if ($toolExitCode -eq 0 -and ($outputText -match 'The restore operation completed successfully' -or $outputText -match 'The operation completed successfully')) {
+if ($toolExitCode -eq 0 -and ((Test-OutputPattern -Text $outputText -Pattern 'The restore operation completed successfully') -or (Test-OutputPattern -Text $outputText -Pattern 'The operation completed successfully'))) {
     $result.Status = 'Changed'; $result.ExitCode = 0; $result.Changed = $true; $result.Message = 'DISM RestoreHealth completed successfully.'; $result.RecommendedAction = 'RunSfcScan'; $result.Data.RawStatus = 'Success'; $result.Data.SfcRequired = $true
 }
 elseif ($toolExitCode -ne 0) {
