@@ -3,7 +3,7 @@
 Runs DISM RestoreHealth and returns a structured result.
 
 .DESCRIPTION
-Runs DISM /Online /Cleanup-Image /RestoreHealth. The script is self-contained for RMM, scheduled task, or direct console use. It writes a detailed log and emits or writes one final structured result.
+Runs DISM /Online /Cleanup-Image /RestoreHealth. The script is self-contained for RMM, scheduled task, or direct console use. It writes a detailed log and emits or writes one final structured result. If started in a 32-bit PowerShell host on a 64-bit Windows OS, it relaunches in 64-bit Windows PowerShell before running DISM.
 
 .PARAMETER OutputFormat
 Controls final structured result output. Object is best for PowerShell callers, Json is best for stdout parsing, and None is best when ResultPath is used.
@@ -13,6 +13,9 @@ Optional log path. Defaults to C:\Temp\Invoke-DismRestoreHealth-<Timestamp>.log.
 
 .PARAMETER ResultPath
 Optional JSON result path for durable machine-readable output.
+
+.PARAMETER SelfSourceUrl
+Raw script URL used only when the script must relaunch from an in-memory 32-bit PowerShell session into 64-bit PowerShell.
 #>
 [CmdletBinding()]
 Param(
@@ -24,8 +27,50 @@ Param(
     [string]$LogPath,
 
     [Parameter(Mandatory = $false)]
-    [string]$ResultPath
+    [string]$ResultPath,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string]$SelfSourceUrl = 'https://raw.githubusercontent.com/AUT-AI-Developer/public-ps-tools/main/dev/windows-image-repair/Invoke-DismRestoreHealth.ps1'
 )
+
+function ConvertTo-SingleQuotedArgument {
+    Param([string]$Value)
+    if ($null -eq $Value) { return "''" }
+    return ("'{0}'" -f ($Value -replace "'", "''"))
+}
+
+function Get-RelayParameterText {
+    $parts = @()
+    $parts += ('-OutputFormat {0}' -f (ConvertTo-SingleQuotedArgument -Value $OutputFormat))
+    if (-not [string]::IsNullOrWhiteSpace($LogPath)) { $parts += ('-LogPath {0}' -f (ConvertTo-SingleQuotedArgument -Value $LogPath)) }
+    if (-not [string]::IsNullOrWhiteSpace($ResultPath)) { $parts += ('-ResultPath {0}' -f (ConvertTo-SingleQuotedArgument -Value $ResultPath)) }
+    if (-not [string]::IsNullOrWhiteSpace($SelfSourceUrl)) { $parts += ('-SelfSourceUrl {0}' -f (ConvertTo-SingleQuotedArgument -Value $SelfSourceUrl)) }
+    return ($parts -join ' ')
+}
+
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    $sysnativePowerShell = Join-Path -Path $env:WINDIR -ChildPath 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $sysnativePowerShell -PathType Leaf)) {
+        Write-Error '64-bit PowerShell is required, but Sysnative Windows PowerShell was not found.'
+        exit 3
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        $argumentList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,'-OutputFormat',$OutputFormat,'-SelfSourceUrl',$SelfSourceUrl)
+        if (-not [string]::IsNullOrWhiteSpace($LogPath)) { $argumentList += @('-LogPath',$LogPath) }
+        if (-not [string]::IsNullOrWhiteSpace($ResultPath)) { $argumentList += @('-ResultPath',$ResultPath) }
+    }
+    else {
+        $relayParameters = Get-RelayParameterText
+        $sourceUrlArgument = ConvertTo-SingleQuotedArgument -Value $SelfSourceUrl
+        $scriptCommand = ('[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ScriptText = (New-Object Net.WebClient).DownloadString({0}); & ([scriptblock]::Create($ScriptText)) {1}' -f $sourceUrlArgument, $relayParameters)
+        $argumentList = @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$scriptCommand)
+    }
+
+    $process = Start-Process -FilePath $sysnativePowerShell -ArgumentList $argumentList -Wait -PassThru -WindowStyle Hidden
+    exit $process.ExitCode
+}
 
 $ScriptName = 'Invoke-DismRestoreHealth'
 $Operation = 'DismRestoreHealth'
@@ -61,15 +106,6 @@ function Get-NativeOutputPath {
     return (Join-Path -Path $scanResultDirectory -ChildPath ('{0}-{1}.txt' -f $OperationName, $OutputTimestamp))
 }
 
-function Test-OutputPattern {
-    Param([string]$Text,[string]$Pattern)
-    if ($Text -match [regex]::Escape($Pattern)) { return $true }
-    $compactText = $Text -replace '\s',''
-    $compactPattern = $Pattern -replace '\s',''
-    if ($compactText -match [regex]::Escape($compactPattern)) { return $true }
-    return $false
-}
-
 function Complete-Script {
     Param([pscustomobject]$Result)
     if (-not [string]::IsNullOrWhiteSpace($Result.ResultPath)) {
@@ -94,11 +130,12 @@ $result = [pscustomobject]@{
     LogPath = $LogPath
     ResultPath = $ResultPath
     RecommendedAction = 'ReviewLog'
-    Data = [pscustomobject]@{ ToolExitCode = $null; RawStatus = 'Unknown'; RepairAttempted = $true; SfcRequired = $false; NativeOutputPath = $null }
+    Data = [pscustomobject]@{ ToolExitCode = $null; RawStatus = 'Unknown'; RepairAttempted = $true; SfcRequired = $false; NativeOutputPath = $null; Is64BitProcess = [Environment]::Is64BitProcess }
     Errors = @()
 }
 
 Write-Log -Message 'Starting DISM RestoreHealth.'
+Write-Log -Message ('PowerShell host is 64-bit process: {0}.' -f [Environment]::Is64BitProcess)
 
 if (-not (Test-Administrator)) {
     $result.Status = 'DependencyMissing'; $result.ExitCode = 3; $result.Message = 'Administrative elevation is required.'; $result.RecommendedAction = 'RunElevated'; $result.Errors += New-ErrorObject -Message $result.Message -RecommendedAction 'RunElevated'; Complete-Script -Result $result
@@ -117,7 +154,7 @@ if (-not [string]::IsNullOrWhiteSpace($outputText)) { Set-Content -LiteralPath $
 $result.Data.ToolExitCode = $toolExitCode
 $result.Data.NativeOutputPath = $outputPath
 
-if ($toolExitCode -eq 0 -and ((Test-OutputPattern -Text $outputText -Pattern 'The restore operation completed successfully') -or (Test-OutputPattern -Text $outputText -Pattern 'The operation completed successfully'))) {
+if ($toolExitCode -eq 0 -and ($outputText -match 'The restore operation completed successfully' -or $outputText -match 'The operation completed successfully')) {
     $result.Status = 'Changed'; $result.ExitCode = 0; $result.Changed = $true; $result.Message = 'DISM RestoreHealth completed successfully.'; $result.RecommendedAction = 'RunSfcScan'; $result.Data.RawStatus = 'Success'; $result.Data.SfcRequired = $true
 }
 elseif ($toolExitCode -ne 0) {
