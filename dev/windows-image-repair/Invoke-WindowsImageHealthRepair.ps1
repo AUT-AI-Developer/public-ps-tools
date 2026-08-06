@@ -20,6 +20,9 @@ Local directory used to store downloaded child scripts and child result files. D
 .PARAMETER ChildScriptBaseUrl
 Base raw GitHub URL used to download missing child scripts.
 
+.PARAMETER SelfSourceUrl
+Raw URL for this orchestrator script. Used only when a 32-bit PowerShell host must relaunch an in-memory GitHub execution into 64-bit PowerShell.
+
 .PARAMETER ForceDownload
 Downloads fresh copies of child scripts even when local copies already exist.
 #>
@@ -44,8 +47,54 @@ Param(
     [string]$ChildScriptBaseUrl = 'https://raw.githubusercontent.com/AUT-AI-Developer/public-ps-tools/main/dev/windows-image-repair',
 
     [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string]$SelfSourceUrl = 'https://raw.githubusercontent.com/AUT-AI-Developer/public-ps-tools/main/dev/windows-image-repair/Invoke-WindowsImageHealthRepair.ps1',
+
+    [Parameter(Mandatory = $false)]
     [switch]$ForceDownload
 )
+
+function ConvertTo-SingleQuotedArgument {
+    Param([string]$Value)
+    if ($null -eq $Value) { return "''" }
+    return ("'{0}'" -f ($Value -replace "'", "''"))
+}
+
+function Get-RelayParameterText {
+    $parts = @()
+    $parts += ('-OutputFormat {0}' -f (ConvertTo-SingleQuotedArgument -Value $OutputFormat))
+    if (-not [string]::IsNullOrWhiteSpace($LogPath)) { $parts += ('-LogPath {0}' -f (ConvertTo-SingleQuotedArgument -Value $LogPath)) }
+    if (-not [string]::IsNullOrWhiteSpace($ResultPath)) { $parts += ('-ResultPath {0}' -f (ConvertTo-SingleQuotedArgument -Value $ResultPath)) }
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) { $parts += ('-WorkingDirectory {0}' -f (ConvertTo-SingleQuotedArgument -Value $WorkingDirectory)) }
+    if (-not [string]::IsNullOrWhiteSpace($ChildScriptBaseUrl)) { $parts += ('-ChildScriptBaseUrl {0}' -f (ConvertTo-SingleQuotedArgument -Value $ChildScriptBaseUrl)) }
+    if (-not [string]::IsNullOrWhiteSpace($SelfSourceUrl)) { $parts += ('-SelfSourceUrl {0}' -f (ConvertTo-SingleQuotedArgument -Value $SelfSourceUrl)) }
+    if ($ForceDownload) { $parts += '-ForceDownload' }
+    return ($parts -join ' ')
+}
+
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    $sysnativePowerShell = Join-Path -Path $env:WINDIR -ChildPath 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $sysnativePowerShell -PathType Leaf)) {
+        Write-Error '64-bit PowerShell is required, but Sysnative Windows PowerShell was not found.'
+        exit 3
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        $argumentList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,'-OutputFormat',$OutputFormat,'-WorkingDirectory',$WorkingDirectory,'-ChildScriptBaseUrl',$ChildScriptBaseUrl,'-SelfSourceUrl',$SelfSourceUrl)
+        if (-not [string]::IsNullOrWhiteSpace($LogPath)) { $argumentList += @('-LogPath',$LogPath) }
+        if (-not [string]::IsNullOrWhiteSpace($ResultPath)) { $argumentList += @('-ResultPath',$ResultPath) }
+        if ($ForceDownload) { $argumentList += '-ForceDownload' }
+    }
+    else {
+        $relayParameters = Get-RelayParameterText
+        $sourceUrlArgument = ConvertTo-SingleQuotedArgument -Value $SelfSourceUrl
+        $scriptCommand = ('[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ScriptText = (New-Object Net.WebClient).DownloadString({0}); & ([scriptblock]::Create($ScriptText)) {1}' -f $sourceUrlArgument, $relayParameters)
+        $argumentList = @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$scriptCommand)
+    }
+
+    $process = Start-Process -FilePath $sysnativePowerShell -ArgumentList $argumentList -Wait -PassThru -WindowStyle Hidden
+    exit $process.ExitCode
+}
 
 $ScriptName = 'Invoke-WindowsImageHealthRepair'
 $Operation = 'WindowsImageHealthRepair'
@@ -65,6 +114,24 @@ function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-OperatingSystemInfo {
+    try { return Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop }
+    catch {
+        try { return Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop }
+        catch { return $null }
+    }
+}
+
+function Test-Windows11Client {
+    Param([object]$OperatingSystem)
+    if ($null -eq $OperatingSystem) { return $false }
+    if ([int]$OperatingSystem.ProductType -ne 1) { return $false }
+    $buildNumber = 0
+    if (-not [int]::TryParse([string]$OperatingSystem.BuildNumber, [ref]$buildNumber)) { return $false }
+    if ($buildNumber -lt 22000) { return $false }
+    return $true
 }
 
 function New-ErrorObject {
@@ -144,11 +211,18 @@ $result = [pscustomobject]@{
     LogPath = $LogPath
     ResultPath = $ResultPath
     RecommendedAction = 'ReviewLog'
-    Data = [pscustomobject]@{ Operations = @(); FinalRecommendedAction = 'ReviewLog'; RebootRecommended = $false; WorkingDirectory = $WorkingDirectory; ChildScriptBaseUrl = $ChildScriptBaseUrl; DownloadedScripts = @() }
+    Data = [pscustomobject]@{ Operations = @(); FinalRecommendedAction = 'ReviewLog'; RebootRecommended = $false; WorkingDirectory = $WorkingDirectory; ChildScriptBaseUrl = $ChildScriptBaseUrl; DownloadedScripts = @(); OperatingSystem = $null; Is64BitProcess = [Environment]::Is64BitProcess }
     Errors = @()
 }
 
 Write-Log -Message 'Starting Windows image health repair workflow.'
+Write-Log -Message ('PowerShell host is 64-bit process: {0}.' -f [Environment]::Is64BitProcess)
+
+$operatingSystem = Get-OperatingSystemInfo
+$result.Data.OperatingSystem = $operatingSystem
+if (-not (Test-Windows11Client -OperatingSystem $operatingSystem)) {
+    $result.Status = 'ValidationFailed'; $result.ExitCode = 2; $result.Message = 'This workflow is supported only on Windows 11 client systems.'; $result.RecommendedAction = 'RunOnWindows11Client'; $result.Data.FinalRecommendedAction = 'RunOnWindows11Client'; $result.Errors += New-ErrorObject -OperationName $Operation -Message $result.Message -RecommendedAction 'RunOnWindows11Client'; Complete-Script -Result $result
+}
 
 if (-not (Test-Administrator)) {
     $result.Status = 'DependencyMissing'; $result.ExitCode = 3; $result.Message = 'Administrative elevation is required.'; $result.RecommendedAction = 'RunElevated'; $result.Data.FinalRecommendedAction = 'RunElevated'; $result.Errors += New-ErrorObject -OperationName $Operation -Message $result.Message -RecommendedAction 'RunElevated'; Complete-Script -Result $result
