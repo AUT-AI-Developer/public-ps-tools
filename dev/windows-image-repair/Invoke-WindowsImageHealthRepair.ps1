@@ -5,6 +5,8 @@ Runs a conditional Windows image health repair workflow.
 .DESCRIPTION
 Runs DISM CheckHealth, conditionally runs DISM ScanHealth and RestoreHealth, and runs SFC verification. The script can download missing child scripts from GitHub into a local working folder, then calls those scripts out-of-process and returns one consolidated structured result.
 
+The workflow supports Windows 10 and Windows 11 clients plus Windows Server member servers and domain controllers. Server compatibility is determined by the local DISM/SFC capabilities exposed by the operating system; unsupported native operations are returned through the existing structured failure contract.
+
 .PARAMETER OutputFormat
 Controls final structured result output. Object is best for PowerShell callers, Json is best for stdout parsing, and None is best when ResultPath is used.
 
@@ -124,13 +126,19 @@ function Get-OperatingSystemInfo {
     }
 }
 
-function Test-Windows11Client {
+function Test-SupportedWindowsOperatingSystem {
     Param([object]$OperatingSystem)
     if ($null -eq $OperatingSystem) { return $false }
-    if ([int]$OperatingSystem.ProductType -ne 1) { return $false }
+
+    $productType = 0
+    if (-not [int]::TryParse([string]$OperatingSystem.ProductType, [ref]$productType)) { return $false }
+
+    if ($productType -in @(2,3)) { return $true }
+    if ($productType -ne 1) { return $false }
+
     $buildNumber = 0
     if (-not [int]::TryParse([string]$OperatingSystem.BuildNumber, [ref]$buildNumber)) { return $false }
-    if ($buildNumber -lt 22000) { return $false }
+    if ($buildNumber -lt 10240) { return $false }
     return $true
 }
 
@@ -220,8 +228,12 @@ Write-Log -Message ('PowerShell host is 64-bit process: {0}.' -f [Environment]::
 
 $operatingSystem = Get-OperatingSystemInfo
 $result.Data.OperatingSystem = $operatingSystem
-if (-not (Test-Windows11Client -OperatingSystem $operatingSystem)) {
-    $result.Status = 'ValidationFailed'; $result.ExitCode = 2; $result.Message = 'This workflow is supported only on Windows 11 client systems.'; $result.RecommendedAction = 'RunOnWindows11Client'; $result.Data.FinalRecommendedAction = 'RunOnWindows11Client'; $result.Errors += New-ErrorObject -OperationName $Operation -Message $result.Message -RecommendedAction 'RunOnWindows11Client'; Complete-Script -Result $result
+if ($null -ne $operatingSystem) {
+    Write-Log -Message ('Detected operating system: {0}; Build={1}; ProductType={2}.' -f [string]$operatingSystem.Caption, [string]$operatingSystem.BuildNumber, [string]$operatingSystem.ProductType)
+}
+
+if (-not (Test-SupportedWindowsOperatingSystem -OperatingSystem $operatingSystem)) {
+    $result.Status = 'ValidationFailed'; $result.ExitCode = 2; $result.Message = 'This workflow requires Windows 10, Windows 11, or Windows Server.'; $result.RecommendedAction = 'RunOnSupportedWindows'; $result.Data.FinalRecommendedAction = 'RunOnSupportedWindows'; $result.Errors += New-ErrorObject -OperationName $Operation -Message $result.Message -RecommendedAction 'RunOnSupportedWindows'; Complete-Script -Result $result
 }
 
 if (-not (Test-Administrator)) {
