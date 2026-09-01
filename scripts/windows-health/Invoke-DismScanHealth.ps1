@@ -152,8 +152,8 @@ function Get-NativeOutputPath {
 function Test-OutputPattern {
     Param([string]$Text, [string]$Pattern)
     if ($null -eq $Text) { return $false }
-    $cleanText = $Text.Replace([char]0, '')
-    $cleanPattern = $Pattern.Replace([char]0, '')
+    $cleanText = $Text.Replace([char]0, [char]32)
+    $cleanPattern = $Pattern.Replace([char]0, [char]32)
     if ($cleanText -match [regex]::Escape($cleanPattern)) { return $true }
     return (($cleanText -replace '\s', '') -match [regex]::Escape(($cleanPattern -replace '\s', '')))
 }
