@@ -242,6 +242,25 @@ function Get-OperatingSystemInfo {
     }
 }
 
+function ConvertTo-CompactOperatingSystemInfo {
+    Param([object]$OperatingSystem)
+
+    if ($null -eq $OperatingSystem) {
+        return $null
+    }
+
+    $productType = 0
+    [void][int]::TryParse([string]$OperatingSystem.ProductType, [ref]$productType)
+
+    return [pscustomobject]@{
+        Caption = [string]$OperatingSystem.Caption
+        Version = [string]$OperatingSystem.Version
+        BuildNumber = [string]$OperatingSystem.BuildNumber
+        ProductType = $productType
+        OSArchitecture = [string]$OperatingSystem.OSArchitecture
+    }
+}
+
 function Test-SupportedWindowsOperatingSystem {
     Param([object]$OperatingSystem)
 
@@ -445,7 +464,7 @@ if ($RequirePinnedSource -and -not (Test-PinnedChildScriptSource -BaseUrl $Child
 }
 
 $operatingSystem = Get-OperatingSystemInfo
-$result.Data.OperatingSystem = $operatingSystem
+$result.Data.OperatingSystem = ConvertTo-CompactOperatingSystemInfo -OperatingSystem $operatingSystem
 if ($operatingSystem) {
     Write-Log -Message ('OS Caption={0}; Version={1}; Build={2}; ProductType={3}.' -f $operatingSystem.Caption, $operatingSystem.Version, $operatingSystem.BuildNumber, $operatingSystem.ProductType)
 }
